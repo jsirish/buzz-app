@@ -204,6 +204,7 @@ import {
 } from "../relay/events";
 import { relayPartition } from "../relay/partition";
 import { threadReference } from "../relay/thread-reference";
+import { compareMessages, eventMs } from "../relay/message-order";
 import {
   type ModelRouteContext,
   type ModelRouter,
@@ -2518,6 +2519,10 @@ const proposedPicture = (value: string | undefined) => {
   if (!picture) throw new Error("Propose an HTTPS image URL as the picture");
   return picture;
 };
+/** Whether an agent's turns can run on a model route: hosted, or on another
+ * execution target, it runs on that one's models. */
+const routable = (agent: Pick<Agent, "place" | "executionBinding">) =>
+  agent.place !== "hosted" && !agent.executionBinding;
 /** The `wss://` URL of a community, as agents and their providers know it. */
 const wssOf = (origin: string) =>
   relayOrigin(origin).replace(/^https:/, "wss:");
@@ -3870,8 +3875,11 @@ export class AgentsService extends Service implements Agents {
       ...type,
       ...(skillFolders && { skillFolders }),
       ...(own && {
-        models: async (agent: Agent<Config>) =>
-          withRoutes(type.id, await own(agent)),
+        models: async (agent: Agent<Config>) => {
+          const listed = await own(agent);
+          // Only where a turn can run on one: see `modelRoute`.
+          return routable(agent) ? withRoutes(type.id, listed) : listed;
+        },
       }),
       ...(voice
         ? {
@@ -4055,8 +4063,7 @@ export class AgentsService extends Service implements Agents {
     signal: AbortSignal,
   ): Promise<((signal: AbortSignal) => Promise<RoutedPick>) | undefined> {
     const models = this.ownModels.get(type.key) ?? type.models;
-    // Hosted, or on another execution target, it runs on that one's models.
-    if (agent.place === "hosted" || agent.executionBinding) return undefined;
+    if (!routable(agent)) return undefined;
     if (!routesFor(type.id).routes.length || !models) return undefined;
     if (pick.model && !routeOf(pick.model)) return undefined;
     // The router reads the prompt and the thread: only for a mention the
@@ -4102,7 +4109,16 @@ export class AgentsService extends Service implements Agents {
         signal: selection,
       });
       if (!chosen.routed) return chosen;
-      noteRoutedTurn(agent.pubkey, chosen.routed);
+      const channelId = place?.channelId;
+      noteRoutedTurn(agent.pubkey, chosen.routed, {
+        ...(channelId && { channelId }),
+        // As every owner-facing view of an agent's conversations checks.
+        ownerReadable: () =>
+          !!channelId &&
+          ownerReads(this.relay(agent.key), agent.pubkey)?.ownerReadable(
+            channelId,
+          ) === true,
+      });
       const { key } = where;
       return key
         ? {
@@ -4233,7 +4249,13 @@ export class AgentsService extends Service implements Agents {
     const reads = ownerReads(this.relay(agent.key), agent.pubkey);
     const root = place?.root;
     if (!reads || !place || (!root && !where.channelHistory)) return [];
-    const current = trigger.type === "mention" ? trigger.event.id : undefined;
+    // Only what came before the turn's message: a reply since, say while
+    // the turn queued, is not the conversation it was asked in.
+    const anchor =
+      trigger.type === "mention" || trigger.type === "watch"
+        ? trigger.event
+        : undefined;
+    const until = anchor && { until: anchor.created_at };
     const events = await reads.read(
       where.channelHistory || !root
         ? [
@@ -4241,9 +4263,7 @@ export class AgentsService extends Service implements Agents {
               kinds: [9, 40002],
               "#h": [place.channelId],
               // The current message and the ones before it.
-              ...(trigger.type === "mention" && {
-                until: trigger.event.created_at,
-              }),
+              ...until,
               limit: ROUTE_HISTORY + 1,
             },
           ]
@@ -4253,14 +4273,25 @@ export class AgentsService extends Service implements Agents {
               kinds: [9, 40002],
               "#h": [place.channelId],
               "#e": [root],
-              limit: ROUTE_HISTORY,
+              ...until,
+              limit: ROUTE_HISTORY + 1,
             },
           ],
       signal,
     );
+    const order = (event: Pick<RelayEvent, "id" | "created_at" | "tags">) => ({
+      id: event.id,
+      createdAt: event.created_at,
+      createdAtMs: eventMs(event),
+    });
+    const cutoff = anchor && order(anchor);
     return [...new Map(events.map((event) => [event.id, event])).values()]
-      .filter((event) => event.id !== current)
-      .sort((a, b) => a.created_at - b.created_at)
+      .filter(
+        (event) =>
+          event.id !== anchor?.id &&
+          (!cutoff || compareMessages(order(event), cutoff) < 0),
+      )
+      .sort((a, b) => compareMessages(order(a), order(b)))
       .slice(-ROUTE_HISTORY)
       .map((event) => ({
         pubkey: event.pubkey,

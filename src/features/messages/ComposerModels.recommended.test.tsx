@@ -233,22 +233,50 @@ it("shows what an agent's route chose for its latest turn", async () => {
       },
     },
   );
+  const readable = { channelId: "c".repeat(64), ownerReadable: () => true };
   act(() =>
-    noteRoutedTurn(pubkey, {
-      route: { id: "auto-balanced", label: "Auto Balanced" },
-      label: "Model B · High",
-    }),
+    noteRoutedTurn(
+      pubkey,
+      {
+        route: { id: "auto-balanced", label: "Auto Balanced" },
+        label: "Model B · High",
+        rationale: "A hard task",
+      },
+      readable,
+    ),
   );
   fireEvent.click(
     await screen.findByRole("button", { name: /^Model and effort/ }),
   );
-  expect(await screen.findByText("Latest turn: Model B · High")).toBeVisible();
+  const chosen = await screen.findByText("Latest turn: Model B · High");
+  expect(chosen).toBeVisible();
+  expect(chosen).toHaveAttribute("title", "Auto Balanced: A hard task");
+  // Why it chose, read from a conversation its owner cannot read, stays out.
+  act(() =>
+    noteRoutedTurn(
+      pubkey,
+      {
+        route: { id: "auto-balanced", label: "Auto Balanced" },
+        label: "Model A · Low",
+        rationale: "From a private DM",
+      },
+      { ...readable, ownerReadable: () => false },
+    ),
+  );
+  expect(await screen.findByText("Latest turn: Model A · Low")).toHaveAttribute(
+    "title",
+    "Auto Balanced",
+  );
   // A long model id may wrap after its dots and underscores.
   act(() =>
-    noteRoutedTurn(pubkey, {
-      route: { id: "auto-balanced", label: "Auto Balanced" },
-      label: "tools_x.goose.model-b · High",
-    }),
+    noteRoutedTurn(
+      pubkey,
+      {
+        route: { id: "auto-balanced", label: "Auto Balanced" },
+        label: "tools_x.goose.model-b · High",
+      },
+      readable,
+    ),
   );
   const line = await screen.findByText(
     "Latest turn: tools_x.goose.model-b · High",

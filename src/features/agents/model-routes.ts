@@ -488,25 +488,45 @@ export type LatestRoutedTurn = Readonly<{
   /** e.g. `Sonnet 5.5 · High`. */
   label: string;
   fallback?: true;
+  /** Only while the owner can read the channel it was chosen for. */
   rationale?: string;
+  /** The channel the turn was chosen for, if any. */
+  channelId?: string;
   /** Unix milliseconds. */
   at: number;
 }>;
-const latest = new Map<string, LatestRoutedTurn>();
+type NotedTurn = Readonly<{
+  turn: LatestRoutedTurn;
+  /** The turn without its rationale, for an owner who cannot read its
+   * channel: a DM only the agent is in, say. */
+  withheld: LatestRoutedTurn;
+  ownerReadable(): boolean;
+}>;
+const latest = new Map<string, NotedTurn>();
 const latestListeners = new Set<() => void>();
-/** Records the turn `pubkey`'s route just chose for (AgentsService). */
+/** Records the turn `pubkey`'s route just chose for in `channelId`
+ * (AgentsService). `ownerReadable` tells, as it is shown, whether the owner
+ * can read that channel. */
 export function noteRoutedTurn(
   pubkey: string,
   routed: NonNullable<RoutedPick["routed"]>,
+  where: Readonly<{ channelId?: string; ownerReadable(): boolean }>,
 ) {
+  const withheld: LatestRoutedTurn = Object.freeze({
+    route: routed.route.label,
+    label: routed.label,
+    ...(routed.fallback && { fallback: true as const }),
+    ...(where.channelId && { channelId: where.channelId }),
+    at: Date.now(),
+  });
   latest.set(
     pubkey,
     Object.freeze({
-      route: routed.route.label,
-      label: routed.label,
-      ...(routed.fallback && { fallback: true as const }),
-      ...(routed.rationale && { rationale: routed.rationale }),
-      at: Date.now(),
+      turn: routed.rationale
+        ? Object.freeze({ ...withheld, rationale: routed.rationale })
+        : withheld,
+      withheld,
+      ownerReadable: where.ownerReadable,
     }),
   );
   for (const listener of latestListeners) listener();
@@ -517,13 +537,17 @@ const subscribeLatest = (listener: () => void) => {
     latestListeners.delete(listener);
   };
 };
-/** The latest turn `pubkey`'s route chose for, rendering again on the next. */
+/** The latest turn `pubkey`'s route chose for, rendering again on the next.
+ * Its rationale, read from that turn's conversation, only while the owner
+ * can read it. */
 export function useLatestRoutedTurn(pubkey: string) {
-  return useSyncExternalStore(
+  const noted = useSyncExternalStore(
     subscribeLatest,
     () => latest.get(pubkey),
     () => latest.get(pubkey),
   );
+  if (!noted) return undefined;
+  return noted.ownerReadable() ? noted.turn : noted.withheld;
 }
 
 // Each conversation's last routed turn, by agent pubkey and the

@@ -1508,6 +1508,41 @@ describe("GooseRuntime", () => {
     goose()?.turns[0]?.finish();
   });
 
+  it("keeps an idle session for a message while its model route chooses", async () => {
+    const { deliver, goose } = setup({ scope: "channel", hold: true });
+    const config = {
+      ...DEFAULT_CONFIG,
+      scope: "channel",
+      model: "route:auto-balanced",
+    };
+    void deliver(message("1", "@Gander first"), {
+      config,
+      route: async () => ({ model: "o3" }),
+    });
+    await vi.waitFor(() => expect(goose()?.turns).toHaveLength(1));
+    goose()?.turns[0]?.finish();
+    // A slow choice for the next message, and a quick one after it.
+    let choose!: (pick: { model: string }) => void;
+    const slow = vi.fn(
+      () =>
+        new Promise<{ model: string }>((resolve) => {
+          choose = resolve;
+        }),
+    );
+    void deliver(message("2", "@Gander second"), { config, route: slow });
+    await vi.waitFor(() => expect(slow).toHaveBeenCalledTimes(1));
+    void deliver(message("3", "@Gander third"), { config });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(goose()?.turns).toHaveLength(1);
+    choose({ model: "o3" });
+    await vi.waitFor(() => expect(goose()?.turns.length).toBeGreaterThan(1));
+    expect(JSON.stringify(goose()?.turns[1])).toContain("@Gander second");
+    expect(JSON.stringify(goose()?.turns[1]?.text)).not.toContain(
+      "@Gander third",
+    );
+    for (const turn of goose()?.turns ?? []) turn.finish();
+  });
+
   it("reads a queued turn's Canvas with the working location its own turn's prompt has", async () => {
     const { agent, deliver, goose } = setup({
       solo: new Set([channel]),

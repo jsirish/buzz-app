@@ -4344,9 +4344,14 @@ it("lets the owner stop a model route while it chooses, running nothing", async 
 });
 
 it("gives a model route the turn's context and its conversation's last routed turn", async () => {
-  const earlier = (id: string, at: number, pubkey: string) =>
-    event(id, { pubkey, created_at: at, tags: [["h", dm]] });
-  const { service, run, emit, ctx } = await setup({
+  const earlier = (
+    id: string,
+    at: number,
+    pubkey: string,
+    tags: string[][] = [["h", dm]],
+  ) => event(id, { pubkey, created_at: at, tags });
+  const thread = "a1".padEnd(64, "0");
+  const { service, run, emit, ctx, session } = await setup({
     history: [earlier("e1", 50, viewer), earlier("e2", 60, bot)],
   });
   await service.create({ type: "example/echo", name: "Echo" });
@@ -4423,6 +4428,68 @@ it("gives a model route the turn's context and its conversation's last routed tu
       },
     },
   });
+  // A reply in a thread reads the thread up to its own message.
+  emit({
+    events: [
+      event("3d3e", {
+        pubkey: viewer,
+        created_at: 90,
+        tags: [
+          ["h", channel],
+          ["p", bot],
+          ["e", thread, "", "reply"],
+          ["model", bot, "route:auto"],
+        ],
+      }),
+    ],
+  });
+  await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(3));
+  const reply = (id: string, at: number) =>
+    earlier(id, at, bot, [
+      ["h", channel],
+      ["e", thread, "", "reply"],
+    ]);
+  // The thread as the relay has it now: a reply came after the message.
+  vi.mocked(session.read).mockResolvedValueOnce([
+    earlier("a1", 50, viewer, [["h", channel]]),
+    reply("a2", 85),
+    reply("a3", 95),
+  ]);
+  await run.mock.calls[2]?.[0]?.route?.();
+  expect(seen[2]).toMatchObject({
+    context: { thread: true },
+    history: [
+      { pubkey: viewer, content: "hello a1", createdAt: 50 },
+      { pubkey: bot, content: "hello a2", createdAt: 85 },
+    ],
+  });
+});
+
+it("offers model routes only to agents whose turns can run on them", async () => {
+  const { service, ctx } = await setup();
+  const agent = await service.create({ type: "example/echo", name: "Echo" });
+  ctx
+    .extend({
+      pluginOwner: bundledOwner(
+        Object.freeze({ id: "org.example", revision: "bundled" }),
+      ),
+    })
+    .agents.registerModelRouter({
+      id: "router",
+      routes: (harness) =>
+        harness === "echo"
+          ? { routes: [{ id: "auto", label: "Auto" }] }
+          : undefined,
+      select: async () => undefined,
+    });
+  const type = service.types().find((item) => item.key === "example/echo");
+  const ids = async (listed: Agent) =>
+    (await type?.models?.(listed))?.models.map(({ id }) => id);
+  expect(await ids(agent)).toContain("route:auto");
+  // On another execution target it runs on that one's models.
+  expect(
+    await ids({ ...agent, executionBinding: { provider: "example.vm" } }),
+  ).not.toContain("route:auto");
 });
 
 it("lists model routes only from bundled plugins", async () => {
